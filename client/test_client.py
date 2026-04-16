@@ -11,11 +11,13 @@ This script tests all system functionality:
 """
 
 import requests
+from requests.adapters import HTTPAdapter
 import json
 import time
 import urllib3
 import psycopg2
 from tabulate import tabulate
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Disable SSL warnings for self-signed certificate
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -65,12 +67,12 @@ def test_login():
     print(f"Response: {json.dumps(data, indent=2)}")
 
     if response.status_code == 200:
-        print(f"\n✅ Login successful!")
+        print(f"\n[PASS] Login successful!")
         print(f"   Instance: {data['instance']}")
         print(f"   Token: {data['token'][:50]}...")
         return data['token']
     else:
-        print(f"\n❌ Login failed!")
+        print(f"\n[FAIL] Login failed!")
         return None
 
 
@@ -99,12 +101,12 @@ def test_normal_request(token):
     print(f"Response: {json.dumps(data, indent=2)}")
 
     if response.status_code == 201:
-        print(f"\n✅ Task created successfully!")
+        print(f"\n[PASS] Task created successfully!")
         print(f"   Request ID: {data['request_id']}")
         print(f"   Instance: {data['instance']}")
         print(f"   Status: {data['status']}")
     else:
-        print(f"\n❌ Task creation failed!")
+        print(f"\n[FAIL] Task creation failed!")
 
 
 # ============================================
@@ -114,19 +116,25 @@ def test_load_balancing(token):
     """Send multiple requests and verify distribution across instances."""
     separator("TEST 3: Load Balancing Verification")
 
-    headers = {"Authorization": f"Bearer {token}"}
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Connection": "close"  # Force new connection each time for round-robin
+    }
     payload = {"task": "lb_test", "payload": {}}
     instances = {}
 
     print("Sending 9 requests to test load balancing...\n")
 
     for i in range(9):
-        response = requests.post(
+        # Use a fresh session each time to force a new TCP connection
+        session = requests.Session()
+        response = session.post(
             f"{BASE_URL}/task",
             json=payload,
             headers=headers,
             verify=False
         )
+        session.close()
         data = response.json()
         instance = data.get('instance', 'unknown')
         instances[instance] = instances.get(instance, 0) + 1
@@ -135,13 +143,13 @@ def test_load_balancing(token):
 
     print(f"\nLoad Distribution:")
     for instance, count in sorted(instances.items()):
-        bar = "█" * (count * 3)
+        bar = "#" * (count * 3)
         print(f"  {instance}: {count} requests {bar}")
 
     if len(instances) > 1:
-        print(f"\n✅ Load balancing is working! Requests distributed across {len(instances)} instances.")
+        print(f"\n[PASS] Load balancing is working! Requests distributed across {len(instances)} instances.")
     else:
-        print(f"\n⚠️  All requests went to one instance. Check Nginx config.")
+        print(f"\n[WARN] All requests went to one instance. Check Nginx config.")
 
 
 # ============================================
@@ -162,9 +170,9 @@ def test_unauthorized():
     print(f"Response: {json.dumps(data, indent=2)}")
 
     if response.status_code == 401:
-        print(f"\n✅ Unauthorized request correctly rejected!")
+        print(f"\n[PASS] Unauthorized request correctly rejected!")
     else:
-        print(f"\n❌ Expected 401, got {response.status_code}")
+        print(f"\n[FAIL] Expected 401, got {response.status_code}")
 
 
 def test_invalid_token():
@@ -185,52 +193,64 @@ def test_invalid_token():
     print(f"Response: {json.dumps(data, indent=2)}")
 
     if response.status_code == 401:
-        print(f"\n✅ Invalid token correctly rejected!")
+        print(f"\n[PASS] Invalid token correctly rejected!")
     else:
-        print(f"\n❌ Expected 401, got {response.status_code}")
+        print(f"\n[FAIL] Expected 401, got {response.status_code}")
 
 
 # ============================================
 # Test 5: Rate Limiting
 # ============================================
 def test_rate_limiting(token):
-    """Send burst requests to trigger rate limiting."""
+    """Send burst requests using multithreading to trigger rate limiting."""
     separator("TEST 5: Rate Limiting")
 
-    headers = {"Authorization": f"Bearer {token}"}
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Connection": "close"
+    }
     payload = {"task": "rate_limit_test", "payload": {}}
 
-    success_count = 0
-    rate_limited_count = 0
-    total_requests = 20
+    results = []
+    total_requests = 50
 
-    print(f"Sending {total_requests} rapid requests to trigger rate limiting...\n")
-
-    for i in range(total_requests):
+    def send_request(i):
+        """Send a single request (called from thread)."""
         try:
-            response = requests.post(
+            session = requests.Session()
+            response = session.post(
                 f"{BASE_URL}/task",
                 json=payload,
                 headers=headers,
                 verify=False
             )
-            if response.status_code == 201:
-                success_count += 1
-            elif response.status_code == 429:
-                rate_limited_count += 1
-                if rate_limited_count == 1:
-                    print(f"  Request {i+1}: 429 Too Many Requests ← Rate limit triggered!")
-        except Exception as e:
-            pass
+            session.close()
+            return response.status_code
+        except Exception:
+            return 0
 
-    print(f"\n  Results:")
+    print(f"Sending {total_requests} concurrent requests to trigger rate limiting...\n")
+
+    # Send requests concurrently using threads
+    with ThreadPoolExecutor(max_workers=30) as executor:
+        futures = [executor.submit(send_request, i) for i in range(total_requests)]
+        for future in as_completed(futures):
+            results.append(future.result())
+
+    success_count = results.count(201)
+    rate_limited_count = results.count(429)
+    other_count = total_requests - success_count - rate_limited_count
+
+    print(f"  Results:")
     print(f"    Successful requests:    {success_count}")
     print(f"    Rate-limited (429):     {rate_limited_count}")
+    if other_count > 0:
+        print(f"    Other responses:        {other_count}")
 
     if rate_limited_count > 0:
-        print(f"\n✅ Rate limiting is working!")
+        print(f"\n[PASS] Rate limiting is working! {rate_limited_count} requests were blocked.")
     else:
-        print(f"\n⚠️  No requests were rate-limited. Try sending more requests.")
+        print(f"\n[WARN] No requests were rate-limited. Try sending more requests.")
 
 
 # ============================================
@@ -310,15 +330,15 @@ def test_database_logs():
             chain = cur.fetchall()
             print(f"  Request ID: {latest[0]}")
             for state_row in chain:
-                print(f"    → {state_row[0]:15s} | {state_row[1]:8s} | {str(state_row[2])[:19]}")
+                print(f"    -> {state_row[0]:15s} | {state_row[1]:8s} | {str(state_row[2])[:19]}")
 
-        print(f"\n✅ Database logs verified!")
+        print(f"\n[PASS] Database logs verified!")
 
         cur.close()
         conn.close()
 
     except Exception as e:
-        print(f"\n❌ Database connection failed: {e}")
+        print(f"\n[FAIL] Database connection failed: {e}")
         print("  Make sure PostgreSQL is running and accessible on localhost:5432")
 
 
@@ -326,23 +346,23 @@ def test_database_logs():
 # Main Test Runner
 # ============================================
 if __name__ == "__main__":
-    print("\n" + "█" * 60)
+    print("\n" + "#" * 60)
     print("  SECURE DISTRIBUTED SYSTEM - TEST CLIENT")
-    print("█" * 60)
+    print("#" * 60)
     print(f"\n  Target: {BASE_URL}")
     print(f"  Time:   {time.strftime('%Y-%m-%d %H:%M:%S')}")
 
     # Test 1: Login
     token = test_login()
     if not token:
-        print("\n❌ Cannot proceed without token. Exiting.")
+        print("\n[FAIL] Cannot proceed without token. Exiting.")
         exit(1)
 
     # Test 2: Normal request
     test_normal_request(token)
 
     # Wait for worker to process
-    print("\n⏳ Waiting 3 seconds for worker to process...")
+    print("\n[..] Waiting 3 seconds for worker to process...")
     time.sleep(3)
 
     # Test 3: Load balancing
@@ -356,11 +376,12 @@ if __name__ == "__main__":
     test_rate_limiting(token)
 
     # Wait for worker to process all
-    print("\n⏳ Waiting 5 seconds for worker to finish processing...")
+    print("\n[..] Waiting 5 seconds for worker to finish processing...")
     time.sleep(5)
 
     # Test 6: Database logs
     test_database_logs()
 
     separator("ALL TESTS COMPLETED")
-    print("\n✅ Review the results above to verify system functionality.\n")
+    print("\n[PASS] Review the results above to verify system functionality.\n")
+
